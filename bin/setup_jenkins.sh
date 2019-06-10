@@ -32,6 +32,7 @@ items:
       type: "Git"
       git:
         uri: "https://github.com/asanCar/advdev_homework_template"
+      contextDir: "openshift-tasks"  
     strategy:
       type: "JenkinsPipeline"
       jenkinsPipelineStrategy:
