@@ -46,17 +46,19 @@ podTemplate(
 
       // TBD: The next two stages should run in parallel
       stage('Run tests') {
-        parallel {
+        parallel 'Unit Tests': {
           // Using Maven run the unit tests
           stage('Unit Tests') {
             echo "Running Unit Tests"
   
             sh mvnCmd + " test"
           }
-  
+        },
+ 
+        'Code Analysis': {
           // Using Maven to call SonarQube for Code Analysis
           stage('Code Analysis') {
-           echo "Running Code Analysis"
+            echo "Running Code Analysis"
   
             sh mvnCmd + " sonar:sonar -Dsonar.host.url=http://sonarqube.gpte-hw-cicd.svc.cluster.local:9000 -DskipTests"
           }
@@ -66,7 +68,7 @@ podTemplate(
       stage('Publish to Nexus') {
         echo "Publish to Nexus"
 
-        sh mvnCmd + " deploy -DaltDeploymentRepository=nexus::default::nexus3.gpte-hw-cicd.svc.cluster.local:8081/repository/releases"
+        sh mvnCmd + " deploy -DskipTests -DaltDeploymentRepository=nexus::default::http://nexus3.gpte-hw-cicd.svc.cluster.local:8081/repository/releases"
       }
 
       // Build the OpenShift Image in OpenShift and tag it.
@@ -76,8 +78,7 @@ podTemplate(
         script {
           openshift.withCluster() {
             openshift.withProject("${GUID}-tasks-dev") {
-              openshift.selector("bc",
-"tasks").startBuild("--from-file=https://nexus-registry.gpte-hw-cicd.svc.cluster.local:5000/repository/releases/org/jboss/quickstarts/eap/tasks/${prodTag}/tasks-${prodTag}.war", "--wait")
+              openshift.selector("bc", "tasks").startBuild("--from-file=http://nexus3.gpte-hw-cicd.svc.cluster.local:8081/repository/releases/org/jboss/quickstarts/eap/tasks/${prodTag}/tasks-${prodTag}.war", "--wait")
               openshift.tag("tasks:latest", "tasks:${devTag}")
             }
           }
@@ -92,21 +93,29 @@ podTemplate(
           openshift.withCluster() {
             openshift.withProject("${GUID}-tasks-dev") {
               def dc = openshift.selector("dc", "tasks").object()
-              dc.spec.template.spec.containers[0].image="image-registry.openshift-image-registry.svc:5000/${GUID}-tasks-dev/tasks:${devTag}"
+              dc.spec.template.spec.containers[0].image = "docker-registry.default.svc:5000/${GUID}-tasks-dev/tasks:${devTag}"
+              dc.spec.template.spec.containers[0].env[0].value = "${devTag} (tasks-dev)"
               openshift.apply(dc)
-              if(openshift.selector("configMap", "tasks-config").exists()) {
-                openshift.selector("configMap", "tasks-config").delete()
+              if(openshift.selector("configmap", "tasks-config").exists()) {
+                openshift.selector("configmap", "tasks-config").delete()
               }
-              openshift.create("configMap", "tasks-config", "--from-file=./configuration/application-users.properties", "--from-file=./configuration/application-roles.properties")
+              openshift.create("configmap", "tasks-config", "--from-file=./configuration/application-users.properties", "--from-file=./configuration/application-roles.properties")
               openshift.selector("dc", "tasks").rollout().latest()
               
               def dc_version = openshift.selector("dc", "tasks").object().status.latestVersion
-              def rc = openshift.selector("dc", "tasks-${dc_version}").object()
+              def rc = openshift.selector("rc", "tasks-${dc_version}").object()
               
               echo "Waiting for ReplicaController tasks-${dc_version} to be ready"
               while(rc.spec.replicas != rc.status.readyReplicas) {
                 sleep 5
                 rc = openshift.selector("rc", "tasks-${dc_version}").object()
+              }
+
+              echo "Waiting web app to be ready"
+              def devTasksRoute = sh(returnStdout: true, script: "curl -s tasks-${GUID}-tasks-dev.apps.${CLUSTER}").trim()
+              while(!devTasksRoute.contains("tasks-dev")) {
+                sleep 15
+                devTasksRoute = sh(returnStdout: true, script: "curl -s tasks-${GUID}-tasks-dev.apps.${CLUSTER}").trim()
               }
             }
           }
@@ -117,7 +126,7 @@ podTemplate(
       stage('Copy Image to Nexus container registry') {
         echo "Copy image to Nexus container registry"
 
-        sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --dest-creds=admin:redhat --src-creds=openshift:\$(oc whoami -t) docker://image-registry.openshift-image-registry.svc:5000/${GUID}-tasks-dev/tasks:${devTag} docker://nexus-registry.gpte-hw-cicd.svc.cluster.local:5000/tasks:${prodTag}"
+        sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --dest-creds=admin:redhat --src-creds=openshift:\$(oc whoami -t) docker://docker-registry.default.svc:5000/${GUID}-tasks-dev/tasks:${devTag} docker://nexus-registry.gpte-hw-cicd.svc.cluster.local:5000/tasks:${prodTag}"
 
         script {
           openshift.withCluster() {
@@ -142,15 +151,16 @@ podTemplate(
               if(activeApp == "tasks-green") {
                 destApp = "tasks-blue"
               }
-              dc. = openshift.selector("dc", destApp).object()
-              dc.spec.template.spec.containers[0].image="image-registry.openshift-image-registry.svc:5000/${GUID}-tasks-dev/tasks:${prodTag}"
+              dc = openshift.selector("dc", destApp).object()
+              dc.spec.template.spec.containers[0].image = "docker-registry.default.svc:5000/${GUID}-tasks-dev/tasks:${prodTag}"
+              dc.spec.template.spec.containers[0].env[0].value = "${prodTag} (${destApp})"
               openshift.apply(dc)
-              configmap = openshift.selector("configMap", destApp + "-config")
+              configmap = openshift.selector("configmap", destApp + "-config")
               if(configmap.exists()) {
                 configmap.delete()
               }
-              openshift.create("configMap", "${destApp}-config", "--from-file=./configuration/application-users.properties", "--from-file=./configuration/application-roles.properties")
-              openshift.selector("dc", destApp).rollout(().latest()
+              openshift.create("configmap", "${destApp}-config", "--from-file=./configuration/application-users.properties", "--from-file=./configuration/application-roles.properties")
+              openshift.selector("dc", destApp).rollout().latest()
 
               def dc_version = openshift.selector("dc", destApp).object().status.latestVersion
               def rc = openshift.selector("rc", "${destApp}-${dc_version}").object()
@@ -171,9 +181,15 @@ podTemplate(
           openshift.withCluster() {
             openshift.withProject("${GUID}-tasks-prod") {
               def route = openshift.selector("route", "tasks").object()
-              route.spec.to.name=destApp
+              route.spec.to.name = destApp
               openshift.apply(route)
             }
+          }
+          echo "Waiting web app to be ready"
+          def prodTasksRoute = sh(returnStdout: true, script: "curl -s tasks-${GUID}-tasks-prod.apps.${CLUSTER}").trim()
+          while(!prodTasksRoute.contains("${destApp}")) {
+            sleep 15
+            prodTasksRoute = sh(returnStdout: true, script: "curl -s tasks-${GUID}-tasks-prod.apps.${CLUSTER}").trim()
           }
         }
       }
